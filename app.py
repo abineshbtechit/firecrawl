@@ -52,7 +52,47 @@ def get_firecrawl_client(api_key):
             return None
 
 firecrawl = get_firecrawl_client(firecrawl_key)
-MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+
+def clean_model_name(name):
+    """
+    Normalizes human-entered model names like 'Gemini 3.1 Flash Lite'
+    into valid Gemini API identifiers like 'gemini-3.1-flash-lite'.
+    """
+    if not name:
+        return DEFAULT_MODEL
+    clean = name.strip()
+    if clean.startswith("models/"):
+        clean = clean[len("models/"):]
+    # Convert spaces/underscores to hyphens and lowercase
+    clean = re.sub(r'[\s_]+', '-', clean).lower()
+    return clean
+
+def generate_with_fallback(g_client, model_name, prompt):
+    """Generates content with automatic fallback to another flash model if quota or busy."""
+    target_model = clean_model_name(model_name)
+    models_to_try = [target_model]
+    for fallback in ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash"]:
+        if fallback not in models_to_try:
+            models_to_try.append(fallback)
+
+    last_error = None
+    for m in models_to_try:
+        try:
+            resp = g_client.models.generate_content(model=m, contents=prompt)
+            return resp.text or ""
+        except Exception as err:
+            last_error = err
+            err_str = str(err)
+            # If unexpected model format, fail fast or try fallback
+            if "unexpected model name format" in err_str:
+                print(f"⚠️ Model format error for '{m}': {err}. Trying fallback...")
+            elif "503" in err_str or "RESOURCE_EXHAUSTED" in err_str or "429" in err_str:
+                print(f"⚠️ Model '{m}' is busy/quota exceeded. Trying fallback...")
+            else:
+                # Other non-retryable error
+                break
+    raise last_error
 
 # Fallback Scrapers: ZenRows
 def scrape_with_zenrows(url):
@@ -150,7 +190,7 @@ def normalize_history(raw_history):
     return clean_history
 
 # 3. CHATBOT BACKEND
-def chatbot(message, history, website_context, live_search_enabled):
+def chatbot(message, history, website_context, live_search_enabled, selected_model):
     history = normalize_history(history)
     message = message.strip()
     if not message:
@@ -158,6 +198,7 @@ def chatbot(message, history, website_context, live_search_enabled):
 
     website_context = website_context or ""
     response_text = ""
+    active_model = clean_model_name(selected_model or DEFAULT_MODEL)
 
     curr_gemini_key = os.getenv("GEMINI_API_KEY") or gemini_key
     curr_firecrawl_key = os.getenv("FIRECRAWL_API_KEY") or firecrawl_key
@@ -218,9 +259,9 @@ def chatbot(message, history, website_context, live_search_enabled):
                 1. Summarize this website in clear, concise bullet points.
                 2. Let the user know they can ask any follow-up questions about this website.
                 """
-                response = g_client.models.generate_content(model=MODEL, contents=prompt)
+                ai_text = generate_with_fallback(g_client, active_model, prompt)
                 badge = f"⚡ Scraped with **{engine_used}**"
-                response_text = f"✅ **Website scraped successfully!** ({badge} | `{detected_url}`)\n\n" + (response.text or "Content extracted.")
+                response_text = f"✅ **Website scraped successfully!** ({badge} | `{detected_url}`)\n\n" + (ai_text or "Content extracted.")
         except Exception as e:
             response_text = f"❌ Website scraping failed: {str(e)}"
 
@@ -253,8 +294,7 @@ def chatbot(message, history, website_context, live_search_enabled):
                 USER QUESTION:
                 {message}
                 """
-                response = g_client.models.generate_content(model=MODEL, contents=prompt)
-                response_text = response.text or "No response generated."
+                response_text = generate_with_fallback(g_client, active_model, prompt) or "No response generated."
 
             # Case 2: Live Web Search & Scraping enabled
             elif live_search_enabled and (fc_client or curr_zenrows_key):
@@ -309,9 +349,9 @@ def chatbot(message, history, website_context, live_search_enabled):
                     USER QUESTION:
                     {message}
                     """
-                    response = g_client.models.generate_content(model=MODEL, contents=prompt)
+                    ai_text = generate_with_fallback(g_client, active_model, prompt)
                     source_footer = f"\n\n**🌐 Live Sources Scraped (via {engine_used}):**\n" + "\n".join(f"- {s}" for s in sources) if sources else ""
-                    response_text = (response.text or "No response generated.") + source_footer
+                    response_text = (ai_text or "No response generated.") + source_footer
                 else:
                     prompt = f"""
                     You are a helpful AI assistant.
@@ -324,8 +364,7 @@ def chatbot(message, history, website_context, live_search_enabled):
                     USER QUESTION:
                     {message}
                     """
-                    response = g_client.models.generate_content(model=MODEL, contents=prompt)
-                    response_text = response.text or "No response generated."
+                    response_text = generate_with_fallback(g_client, active_model, prompt) or "No response generated."
 
             # Case 3: Standard LLM chat
             else:
@@ -340,8 +379,7 @@ def chatbot(message, history, website_context, live_search_enabled):
                 USER QUESTION:
                 {message}
                 """
-                response = g_client.models.generate_content(model=MODEL, contents=prompt)
-                response_text = response.text or "No response generated."
+                response_text = generate_with_fallback(g_client, active_model, prompt) or "No response generated."
 
         except Exception as e:
             response_text = f"❌ Gemini error: {str(e)}"
@@ -365,12 +403,18 @@ with gr.Blocks(title="UniSearch AI Chat") as demo:
         message = gr.Textbox(
             placeholder="Ask anything (e.g. 'sabarimala today crowd') or paste a website URL (e.g. 'https://...')...",
             label="Your Message",
-            scale=8
+            scale=7
+        )
+        model_dropdown = gr.Dropdown(
+            choices=["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash"],
+            value=DEFAULT_MODEL,
+            label="Gemini Model",
+            scale=2
         )
         live_search_toggle = gr.Checkbox(
             value=True,
             label="🌐 Live Web Scraping",
-            info="Firecrawl primary with ZenRows automatic fallback",
+            info="Firecrawl primary, ZenRows fallback",
             scale=2
         )
 
@@ -380,13 +424,13 @@ with gr.Blocks(title="UniSearch AI Chat") as demo:
 
     send.click(
         chatbot,
-        inputs=[message, chat, website_context, live_search_toggle],
+        inputs=[message, chat, website_context, live_search_toggle, model_dropdown],
         outputs=[chat, website_context]
     ).then(lambda: "", outputs=message)
 
     message.submit(
         chatbot,
-        inputs=[message, chat, website_context, live_search_toggle],
+        inputs=[message, chat, website_context, live_search_toggle, model_dropdown],
         outputs=[chat, website_context]
     ).then(lambda: "", outputs=message)
 
@@ -394,8 +438,3 @@ with gr.Blocks(title="UniSearch AI Chat") as demo:
 
 if __name__ == "__main__":
     demo.launch(debug=True)
-
-
-
-
-dsvcs
